@@ -119,6 +119,7 @@ examples/output/**
 debug/
 debug*.py
 logs/
+evoagentx/app/app.env
 server/tunnel_info.json
 server/mcp.config
-
+server/app.env

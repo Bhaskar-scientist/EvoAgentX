@@ -24,25 +24,51 @@ class ClientTaskResponse(BaseModel):
     status: str
     client_id: str
 
-# New models for project-based approach
+# Updated workflow-based models (replacing project-based approach)
 class ProjectSetupRequest(BaseModel):
-    """Request model for project setup"""
-    goal: str
-    additional_info: Optional[Dict[str, Any]] = None  # Any additional project information
+    """Request model for workflow setup - Phase 1"""
+    workflow_id: str
+    requirement_id: str
+    user_id: str
 
 class ProjectSetupResponse(BaseModel):
-    """Response model for project setup"""
-    project_id: str
-    public_url: str
-    task_info: str  # Contains connection_instruction from the LLM-generated task info
+    """Response model for workflow setup - Phase 1"""
+    task_info: Dict[str, Any]
 
 class ProjectWorkflowGenerationRequest(BaseModel):
-    """Request model for project-based workflow generation"""
-    project_id: str
-    llm_config: Optional[Dict[str, Any]] = None  # Optional, will use default if not provided
+    """Request model for workflow generation - Phase 2"""
+    workflow_id: str
+
+class ProjectWorkflowGenerationResponse(BaseModel):
+    """Response model for workflow generation - Phase 2"""
+    workflow_graph: Dict[str, Any]
+    status: str  # success, failed
 
 class ProjectWorkflowExecutionRequest(BaseModel):
-    """Request model for project-based workflow execution"""
-    project_id: str
-    inputs: Dict[str, Any]  # Inputs dictionary to pass to workflow execution
-    llm_config: Optional[Dict[str, Any]] = None  # Optional, will use default if not provided 
+    """Request model for workflow execution - Phase 3"""
+    workflow_id: str
+    inputs: Dict[str, Any]
+
+class ProjectWorkflowExecutionResponse(BaseModel):
+    """Response model for workflow execution - Phase 3"""
+    execution_result: Optional[Dict[str, Any]] = None  # running result / status
+
+# Legacy aliases for backward compatibility
+setup_input = ProjectSetupRequest
+setup_output = ProjectSetupResponse
+workflow_generation_input = ProjectWorkflowGenerationRequest
+workflow_generation_output = ProjectWorkflowGenerationResponse
+workflow_execution_input = ProjectWorkflowExecutionRequest
+workflow_execution_output = ProjectWorkflowExecutionResponse
+
+## Database Schema for Workflow Storage:
+# workflow_id: str (Primary Key)
+# user_id: str
+# requirement_id: str
+# task_info: Optional[Dict[str, Any]] = None       # saved after setup phase
+# workflow_graph: Optional[Dict[str, Any]] = None  # saved after generation phase
+# execution_result: Optional[Dict[str, Any]] = None # saved after execution phase
+# created_at: datetime
+# updated_at: datetime
+
+

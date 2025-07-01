@@ -6,3 +6,4 @@ aiohttp
 sseclient-py
 requests
 pyngrok
+supabase

@@ -19,6 +19,8 @@ TUNNEL_INFO_PATH = "./server/tunnel_info.json"
 tunnel_process = None
 ngrok_tunnel = None
 
+
+
 def cleanup_tunnel():
     global tunnel_process, ngrok_tunnel
     if TUNNEL_METHOD == "ngrok" and ngrok_tunnel:
@@ -150,6 +152,8 @@ if __name__ == "__main__":
             json.dump(tunnel_info, f, indent=2)
         print("🌍 Public tunnel: Not created")
     
+
+    
     try:
         uvicorn.run(
             app, 
@@ -161,6 +165,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n🛑 Server interrupted by user")
     finally:
+        # Clean up tunnel
         cleanup_tunnel()
 
 

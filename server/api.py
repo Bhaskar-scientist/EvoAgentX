@@ -4,9 +4,18 @@ import json
 import asyncio
 import uuid
 from datetime import datetime
+from contextlib import asynccontextmanager
 
-from .models import Config, ProcessResponse, ClientConnectResponse, ClientTaskResponse, ProjectSetupRequest, ProjectSetupResponse, ProjectWorkflowGenerationRequest, ProjectWorkflowExecutionRequest
-from .service import handle_process_request, start_streaming_task, setup_project, get_project, list_projects, generate_workflow_for_project, execute_workflow_for_project
+from .models import (
+    Config, ProcessResponse, ClientConnectResponse, ClientTaskResponse, 
+    ProjectSetupRequest, ProjectSetupResponse, ProjectWorkflowGenerationRequest, ProjectWorkflowGenerationResponse,
+    ProjectWorkflowExecutionRequest, ProjectWorkflowExecutionResponse
+)
+from .service import (
+    handle_process_request, start_streaming_task, setup_project, get_project, list_projects, 
+    generate_workflow_for_project, execute_workflow_for_project
+)
+from .db import initialize_database, close_database, seed_database
 from .task_manager import (
     get_stream_task, get_stream_task_updates, is_stream_task_completed,
     create_client_session, get_client_session, get_client_updates, 
@@ -26,90 +35,111 @@ async def process_request(config: Config) -> ProcessResponse:
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# New project-based endpoints
+# Updated workflow-based endpoints (using original project endpoints)
 @app.post("/project/setup", response_model=ProjectSetupResponse)
 async def setup_new_project(request: ProjectSetupRequest) -> ProjectSetupResponse:
     """
-    Setup a new project with the given goal and return project information.
-    This is the main entry point for creating projects.
+    Phase 1: Setup workflow and generate task_info.
+    This is the first phase of the workflow process.
     """
     try:
-        result = setup_project(request.goal, request.additional_info)
-        
-        return ProjectSetupResponse(
-            project_id=result["project_id"],
-            public_url=result["public_url"],
-            task_info=result["task_info"]  # This is now the connection instruction string
-        )
-        
+        result = await setup_project(request.workflow_id, request.requirement_id, request.user_id)
+        return ProjectSetupResponse(task_info=result)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error setting up project: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error setting up workflow: {str(e)}")
 
-
-# Project-based workflow generation endpoint
-@app.post("/workflow/generate")
-async def generate_workflow_for_project_api(request: ProjectWorkflowGenerationRequest):
+@app.post("/workflow/generate", response_model=ProjectWorkflowGenerationResponse)
+async def generate_workflow_for_project_api(request: ProjectWorkflowGenerationRequest) -> ProjectWorkflowGenerationResponse:
     """
-    Generate a workflow for a specific project.
-    Gets inputs and outputs from the stored project data.
-    Uses default_llm_config if no config is provided.
+    Phase 2: Generate workflow graph based on task_info.
+    This is the second phase of the workflow process.
     """
     try:
-        result = await generate_workflow_for_project(
-            request.project_id, 
-            request.llm_config
+        result = await generate_workflow_for_project(request.workflow_id)
+        return ProjectWorkflowGenerationResponse(
+            workflow_graph=result["workflow_graph"],
+            status=result["status"]
         )
-        
-        if not result.get("success"):
-            raise HTTPException(
-                status_code=400 if "not found" in result.get("error", "") else 500,
-                detail=result.get("error", "Unknown error")
-            )
-        
-        return {
-            "success": True,
-            "project_id": result["project_id"],
-            "workflow_graph": result["workflow_graph"]
-        }
-        
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating workflow: {str(e)}")
 
-# Project-based workflow execution endpoint
-@app.post("/workflow/execute")
-async def execute_workflow_for_project_api(request: ProjectWorkflowExecutionRequest):
+@app.post("/workflow/execute", response_model=ProjectWorkflowExecutionResponse)
+async def execute_workflow_for_project_api(request: ProjectWorkflowExecutionRequest) -> ProjectWorkflowExecutionResponse:
     """
-    Execute a workflow for a specific project using the inputs dictionary.
-    Uses default_llm_config if no config is provided.
-    Gets workflow from project database.
+    Phase 3: Execute workflow with provided inputs.
+    This is the third phase of the workflow process.
     """
     try:
-        result = await execute_workflow_for_project(
-            request.project_id, 
-            request.inputs, 
-            request.llm_config
-        )
-        
-        if not result.get("success"):
-            raise HTTPException(
-                status_code=400 if "not found" in result.get("error", "") else 500,
-                detail=result.get("error", "Unknown error")
-            )
-        
-        return {
-            "success": True,
-            "project_id": result["project_id"],
-            "execution_result": result["execution_result"],
-            "message": result["message"],
-            "timestamp": result["timestamp"]
-        }
-        
-    except HTTPException:
-        raise
+        result = await execute_workflow_for_project(request.workflow_id, request.inputs)
+        return ProjectWorkflowExecutionResponse(execution_result=result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error executing workflow: {str(e)}")
+
+# Workflow management endpoints
+@app.get("/workflow/{workflow_id}/status")
+async def get_workflow_status(workflow_id: str):
+    """
+    Get the current status and details of a workflow.
+    Shows which phase the workflow is in and all stored data.
+    """
+    try:
+        workflow = await get_project(workflow_id)
+        if not workflow:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+        
+        return {
+            "workflow_id": workflow_id,
+            "status": workflow.get("status", "unknown"),
+            "user_id": workflow.get("user_id"),
+            "requirement_id": workflow.get("requirement_id"),
+            "created_at": workflow.get("created_at"),
+            "updated_at": workflow.get("updated_at"),
+            "phases": {
+                "setup_complete": workflow.get("task_info") is not None,
+                "generation_complete": workflow.get("workflow_graph") is not None,
+                "execution_complete": workflow.get("execution_result") is not None
+            },
+            "task_info": workflow.get("task_info"),
+            "workflow_graph": workflow.get("workflow_graph"),
+            "execution_result": workflow.get("execution_result")
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting workflow status: {str(e)}")
+
+@app.get("/workflows")
+async def get_all_workflows():
+    """
+    List all workflows in the system with their current status.
+    """
+    try:
+        workflows_info = await list_projects()
+        
+        # Get detailed info for each workflow
+        detailed_workflows = []
+        for workflow_id in workflows_info["projects"]:
+            workflow = await get_project(workflow_id)
+            if workflow:
+                detailed_workflows.append({
+                    "workflow_id": workflow_id,
+                    "status": workflow.get("status", "unknown"),
+                    "user_id": workflow.get("user_id"),
+                    "requirement_id": workflow.get("requirement_id"),
+                    "created_at": workflow.get("created_at"),
+                    "updated_at": workflow.get("updated_at"),
+                    "phases_complete": {
+                        "setup": workflow.get("task_info") is not None,
+                        "generation": workflow.get("workflow_graph") is not None,
+                        "execution": workflow.get("execution_result") is not None
+                    }
+                })
+        
+        return {
+            "workflows": detailed_workflows,
+            "total_count": workflows_info["total_count"],
+            "active_workflows": workflows_info["active_projects"]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error listing workflows: {str(e)}")
 
 @app.post("/stream/process")
 async def start_stream_process(config: Config):
@@ -117,10 +147,6 @@ async def start_stream_process(config: Config):
     Start a streaming process and return a task ID.
     """
     return await start_streaming_task(config.dict())
-
-
-
-
 
 # New client-session endpoints
 @app.post("/connect", response_model=ClientConnectResponse)
@@ -135,8 +161,6 @@ async def connect_client() -> ClientConnectResponse:
         client_id=client_id,
         stream_url=f"/stream/client/{client_id}"
     )
-
-
 
 @app.get("/stream/client/{client_id}")
 async def stream_client_updates(client_id: str):
@@ -254,6 +278,34 @@ async def health_check():
     """Basic health check endpoint"""
     return {"status": "healthy"}
 
+@app.get("/debug/database")
+async def debug_database():
+    """Debug endpoint to view database contents"""
+    from .db import database
+    
+    if not database:
+        raise HTTPException(status_code=500, detail="Database not initialized")
+    
+    try:
+        result = {
+            "users": await database.find_many("users", limit=50),
+            "requirements": await database.find_many("requirements", limit=50), 
+            "workflows": await database.find_many("workflows", limit=50),
+            "workflow_templates": await database.find_many("workflow_templates", limit=50)
+        }
+        
+        # Add counts
+        result["counts"] = {
+            "users": await database.count("users"),
+            "requirements": await database.count("requirements"),
+            "workflows": await database.count("workflows"), 
+            "workflow_templates": await database.count("workflow_templates")
+        }
+        
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reading database: {str(e)}")
+
 @app.get("/clients")
 async def list_clients():
     """List all active client sessions (for debugging)"""
@@ -271,13 +323,12 @@ async def list_clients():
     
     return {"active_clients": active_clients, "total": len(active_clients)} 
 
-
 @app.get("/project/{project_id}/status")
 async def get_project_status(project_id: str):
     """
     Get the current status and information for a specific project.
     """
-    project = get_project(project_id)
+    project = await get_project(project_id)
     
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -298,4 +349,4 @@ async def get_all_projects():
     """
     List all projects in the system.
     """
-    return list_projects() 
+    return await list_projects() 

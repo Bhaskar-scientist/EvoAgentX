@@ -15,6 +15,7 @@ from evoagentx.core.module_utils import parse_json_from_text
 from evoagentx.tools import MCPToolkit, FileTool
 
 from .prompts import WORKFLOW_GENERATION_PROMPT, TASK_INFO_PROMPT_SUDO, CONNECTION_INSTRUCTION_PROMPT
+from .db import database
 
 from .task_manager import (
     store_task_result,
@@ -43,8 +44,9 @@ sudo_workflow = None
 sudo_execution_result = None
 
 
-# In-memory project database
-project_info: Dict[str, Dict[str, Any]] = {}
+# Database will be initialized in main.py
+# Use the global workflow_db instance from db.py
+
 default_tools = MCPToolkit(config_path=MCP_CONFIG_PATH).get_tools()
 default_tools += [FileTool()]
 # default_tools = []
@@ -338,111 +340,154 @@ def generate_project_id() -> str:
     """Generate a unique project ID"""
     return f"proj_{uuid.uuid4().hex[:12]}"
 
-def setup_project(goal: str, additional_info: Dict[str, Any] = None) -> Dict[str, Any]:
-    """Setup a new project with the given goal and additional information"""
-    project_id = generate_project_id()
+async def setup_project(workflow_id: str, requirement_id: str, user_id: str) -> Dict[str, Any]:
+    """
+    Phase 1: Setup workflow and generate task_info.
+    Updated to use generalized database and retrieve requirement information.
+    """
+    # Check if workflow already exists (for logging purposes)
+    existing_workflow = await database.find_one("workflows", {"id": workflow_id})
+    workflow_exists = existing_workflow is not None
+    
+    if workflow_exists:
+        print(f"🔄 Workflow {workflow_id} already exists, will update with new setup")
+    
+    # Retrieve requirement information from database
+    requirement = await database.find_one("requirements", {"id": requirement_id})
+    if not requirement:
+        raise ValueError(f"Requirement with ID {requirement_id} not found")
+    
+    # Extract goal from requirement description field
+    goal = requirement.get("description", "")
+    if not goal:
+        # Fallback to goal field if description is empty
+        goal = requirement.get("goal", f"Complete task for requirement {requirement_id}")
+    
+    # Prepare additional info from requirement
+    additional_info = {
+        "title": requirement.get("title", ""),
+        "category": requirement.get("category", ""),
+        "status": requirement.get("status", ""),
+        "llm_config": default_llm_config
+    }
     
     # Get tunnel information
     tunnel_info = read_tunnel_info()
     public_url = tunnel_info.get("public_url") if tunnel_info else None
     
-    # Generate comprehensive task info
-    task_info = create_task_info(project_id, goal, additional_info or {}, public_url)
+    # Generate comprehensive task info (reusing existing logic)
+    task_info = create_task_info(
+        workflow_id, 
+        goal, 
+        additional_info, 
+        public_url
+    )
     
-    # Store project in database
-    project_data = {
-        "project_id": project_id,
-        "goal": goal,
-        "additional_info": additional_info or {},
-        "status": "created",
-        "created_at": datetime.now().isoformat(),
-        "workflow_generated": False,
-        "workflow_executed": False,
-        "public_url": public_url,
-        "task_info": task_info  # Store the full task_info object
-    }
+    if workflow_exists:
+        # Update existing workflow with complete new setup
+        await database.update(
+            "workflows",
+            {"id": workflow_id},
+            {
+                "user_id": user_id,
+                "requirement_id": requirement_id,
+                "task_info": task_info,
+                "workflow_graph": None,
+                "execution_result": None,
+                "status": "uninitialized"
+            }
+        )
+        print(f"✅ Updated existing workflow {workflow_id} with new setup")
+    else:
+        # Create new workflow document
+        workflow_doc = {
+            "id": workflow_id,
+            "user_id": user_id,
+            "requirement_id": requirement_id,
+            "task_info": task_info,
+            "workflow_graph": None,
+            "execution_result": None,
+            "status": "uninitialized"
+        }
+        await database.insert("workflows", workflow_doc)
+        print(f"✅ Created new workflow {workflow_id}")
     
-    project_info[project_id] = project_data
+    return task_info
+
+async def get_project(workflow_id: str) -> Dict[str, Any]:
+    """Retrieve workflow information from the database"""
+    return await database.find_one("workflows", {"id": workflow_id})
+
+async def update_project_status(workflow_id: str, status: str, **kwargs):
+    """Update workflow status and other fields"""
+    # Update status and any additional fields
+    updates = {"status": status, **kwargs}
+    await database.update(
+        "workflows", 
+        {"id": workflow_id}, 
+        updates
+    )
+
+async def list_projects() -> Dict[str, Any]:
+    """List all workflows in the database"""
+    workflows = await database.find_many("workflows")
+    total_count = await database.count("workflows")
+    
+    active_projects = [
+        w["id"] for w in workflows 
+        if w.get("status") not in ["completed", "failed"]
+    ]
     
     return {
-        "project_id": project_id,
-        "public_url": project_data["public_url"] or "Not available",
-        "task_info": task_info.get("connection_instruction", "Not available")  # Return connection instruction string
+        "projects": [w["id"] for w in workflows],
+        "total_count": total_count,
+        "active_projects": active_projects
     }
 
-def get_project(project_id: str) -> Dict[str, Any]:
-    """Retrieve project information from the database"""
-    return project_info.get(project_id)
-
-def update_project_status(project_id: str, status: str, **kwargs):
-    """Update project status and other fields"""
-    if project_id in project_info:
-        project_info[project_id]["status"] = status
-        project_info[project_id]["last_updated"] = datetime.now().isoformat()
-        
-        # Update any additional fields
-        for key, value in kwargs.items():
-            project_info[project_id][key] = value
-
-def list_projects() -> Dict[str, Any]:
-    """List all projects in the database"""
-    return {
-        "projects": list(project_info.keys()),
-        "total_count": len(project_info),
-        "active_projects": [
-            pid for pid, data in project_info.items() 
-            if data.get("status") != "completed"
-        ]
-    }
-
-async def generate_workflow_for_project(project_id: str, llm_config_dict: Dict[str, Any] = None) -> Dict[str, Any]:
+async def generate_workflow_for_project(workflow_id: str) -> Dict[str, Any]:
     """
-    Generate workflow for a specific project.
-    Gets goal and workflow specifications from stored project data.
-    Uses default_llm_config if no config provided.
+    Phase 2: Generate workflow graph based on task_info.
+    Updated to use new database structure.
     """
-    # Check if project exists
-    project = get_project(project_id)
-    if not project:
-        return {
-            "success": False,
-            "error": "Project not found"
-        }
+    # Check if workflow exists
+    workflow = await get_project(workflow_id)
+    if not workflow:
+        raise ValueError(f"Workflow with ID {workflow_id} not found")
     
-    # Get goal from project data
-    goal = project.get("goal")
-    if not goal:
-        return {
-            "success": False,
-            "error": "Goal not found in project data"
-        }
+    # Check if setup was completed
+    if workflow.get("task_info") is None:
+        raise ValueError(f"Workflow {workflow_id} has not completed setup phase")
     
-    # Get workflow inputs and outputs from task_info
-    task_info = project.get("task_info", {})
-    print(project)
+    task_info = workflow["task_info"]
+    
+    # Extract information for workflow generation
+    goal = task_info.get("workflow_description", "")
     workflow_inputs = task_info.get("workflow_inputs", [])
     workflow_outputs = task_info.get("workflow_outputs", [])
     
     # Format the prompt with goal, inputs, and outputs
-    formatted_goal = WORKFLOW_GENERATION_PROMPT.format(goal=goal, inputs=workflow_inputs, outputs=workflow_outputs)
-    print(formatted_goal)
-    
-    # Use default config if none provided
-    if not llm_config_dict:
-        llm_config_dict = default_llm_config
+    formatted_goal = WORKFLOW_GENERATION_PROMPT.format(
+        goal=goal, 
+        inputs=workflow_inputs, 
+        outputs=workflow_outputs
+    )
     
     try:
-        # Update project status
-        update_project_status(project_id, "generating_workflow")
+        # Update workflow status
+        await update_project_status(workflow_id, "running")
         
-        # Use the formatted goal for workflow generation
-        workflow_graph = await generate_workflow_from_goal(formatted_goal, llm_config_dict, mcp_config={})
+        # Generate workflow graph
+        workflow_graph = await generate_workflow_from_goal(
+            formatted_goal, 
+            default_llm_config, 
+            mcp_config={}
+        )
         
         if workflow_graph is None:
-            update_project_status(project_id, "generation_failed")
+            await update_project_status(workflow_id, "failed")
             return {
-                "success": False,
-                "error": "Failed to generate workflow"
+                "workflow_graph": {},
+                "status": "failed"
             }
         
         # Convert workflow_graph to serializable format
@@ -459,75 +504,59 @@ async def generate_workflow_for_project(project_id: str, llm_config_dict: Dict[s
         except Exception as e:
             workflow_dict = f"Workflow generated successfully (serialization error: {str(e)})"
         
-        # Update project with workflow data
-        update_project_status(
-            project_id, 
-            "workflow_generated",
-            workflow_generated=True,
-            workflow_data=workflow_dict
+        # Update workflow storage with generated graph
+        await update_project_status(
+            workflow_id, 
+            "pending",
+            workflow_graph=workflow_dict
         )
         
         return {
-            "success": True,
-            "project_id": project_id,
-            "workflow_graph": workflow_dict
+            "workflow_graph": workflow_dict,
+            "status": "success"
         }
         
     except Exception as e:
-        update_project_status(project_id, "generation_failed")
-        return {
-            "success": False,
-            "error": f"Error generating workflow: {str(e)}"
-        }
+        await update_project_status(workflow_id, "failed")
+        raise ValueError(f"Error generating workflow: {str(e)}")
 
-async def execute_workflow_for_project(project_id: str, inputs: Dict[str, Any], llm_config_dict: Dict[str, Any] = None) -> Dict[str, Any]:
+async def execute_workflow_for_project(workflow_id: str, inputs: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Execute workflow for a specific project using inputs dictionary.
-    Uses default_llm_config if no config provided.
-    Gets workflow from project database.
+    Phase 3: Execute workflow with provided inputs.
+    Updated to use new database structure.
     """
-    # Check if project exists
-    project = get_project(project_id)
-    if not project:
-        return {
-            "success": False,
-            "error": "Project not found"
-        }
+    # Check if workflow exists
+    workflow = await get_project(workflow_id)
+    if not workflow:
+        raise ValueError(f"Workflow with ID {workflow_id} not found")
     
-    # Check if workflow was generated for this project
-    if not project.get("workflow_generated") or not project.get("workflow_data"):
-        return {
-            "success": False,
-            "error": "No workflow found for this project. Please generate a workflow first."
-        }
-    
-    # Use default config if none provided
-    if not llm_config_dict:
-        llm_config_dict = default_llm_config
+    # Check if workflow generation was completed
+    if workflow.get("workflow_graph") is None:
+        raise ValueError(f"Workflow {workflow_id} has not completed generation phase")
     
     try:
-        # Update project status
-        update_project_status(project_id, "executing_workflow")
+        # Update workflow status
+        await update_project_status(workflow_id, "running")
         
-        # Get workflow data from project
-        workflow_data = project.get("workflow_data")
+        # Get workflow graph
+        workflow_graph = workflow["workflow_graph"]
         
         # Execute the workflow
         execution_result = await execute_workflow_from_config(
-            workflow_data, 
-            llm_config_dict, 
+            workflow_graph, 
+            default_llm_config, 
             mcp_config={}, 
             inputs=inputs
         )
         
         if execution_result is None:
-            update_project_status(project_id, "execution_failed")
+            await update_project_status(workflow_id, "failed")
             return {
-                "success": False,
+                "status": "failed",
                 "error": "Failed to execute workflow"
             }
         
-        # Extract the message from execution result if it's a dict
+        # Process execution result
         if isinstance(execution_result, dict):
             execution_message = execution_result.get("message", "")
         else:
@@ -546,37 +575,15 @@ async def execute_workflow_for_project(project_id: str, inputs: Dict[str, Any], 
         else:
             execution_result = execution_message
         
-        # Create comprehensive workflow info including public URL
-        config_for_workflow_info = {
-            "workflow": workflow_data,
-            "llm_config": llm_config_dict,
-            "mcp_config": {},
-            "inputs": inputs
-        }
-        workflow_info = create_workflow_info(config_for_workflow_info, execution_result)
-        
-        # Update project with execution results
-        update_project_status(
-            project_id, 
-            "workflow_executed",
-            workflow_executed=True,
-            execution_results=execution_result,
-            workflow_info=workflow_info
+        # Update workflow storage with execution results
+        await update_project_status(
+            workflow_id, 
+            "completed",
+            execution_result=execution_result
         )
         
-        return {
-            "success": True,
-            "project_id": project_id,
-            "execution_result": execution_result,
-            "workflow_info": workflow_info,
-            "inputs": inputs,
-            "message": "Workflow executed successfully for project",
-            "timestamp": datetime.now().isoformat()
-        }
+        return execution_result
         
     except Exception as e:
-        update_project_status(project_id, "execution_failed")
-        return {
-            "success": False,
-            "error": f"Error executing workflow: {str(e)}"
-        }
+        await update_project_status(workflow_id, "failed")
+        raise ValueError(f"Error executing workflow: {str(e)}")
