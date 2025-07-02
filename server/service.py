@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 from evoagentx.workflow import WorkFlowGenerator, WorkFlowGraph, WorkFlow
 from evoagentx.models import LLMConfig
-from evoagentx.models.model_configs import OpenAILLMConfig
+from evoagentx.models.model_configs import OpenAILLMConfig, OpenRouterConfig
 from evoagentx.models.model_utils import create_llm_instance
 from evoagentx.agents.agent_manager import AgentManager
 from evoagentx.core.module_utils import parse_json_from_text
@@ -29,13 +29,22 @@ from .models import ProcessResponse
 
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+# default_llm_config = {
+#     "model": "gpt-4o-mini",
+#     "openai_key": OPENAI_API_KEY,
+#     "stream": True,
+#     "output_response": True,
+#     "max_tokens": 16000
+# }
 default_llm_config = {
-    "model": "gpt-4o-mini",
-    "openai_key": OPENAI_API_KEY,
+    "model": "openai/gpt-4o-mini",
+    "openrouter_key": OPENROUTER_API_KEY,
     "stream": True,
     "output_response": True,
     "max_tokens": 16000
 }
+
 TUNNEL_INFO_PATH = "./server/tunnel_info.json"
 MCP_CONFIG_PATH = "./server/mcp.config"
 # sudo_workflow = WorkFlow.from_file("examples/output/jobs/jobs_demo_4o_mini.json")
@@ -142,21 +151,19 @@ def create_task_info(project_id: str, goal: str, additional_info: Dict[str, Any]
 
 def create_llm_config(llm_config_dict: Dict[str, Any]) -> LLMConfig:
     """
-    Convert a dictionary to the appropriate LLM config object based on the model type.
+    Convert a dictionary to the appropriate LLM config object based on the API key provided,
+    then fallback to model type detection.
     """
-    model = llm_config_dict.get("model", "").lower()
     
-    # Determine the appropriate config class based on the model
-    if "gpt" in model or "openai" in model:
-        return OpenAILLMConfig(**llm_config_dict)
+    # Priority 1: Check which API key is provided (most explicit indicator of intent)
+    if llm_config_dict.get("openrouter_key"):
+        # If openrouter_key is provided, use OpenRouter regardless of model
+        return OpenRouterConfig(**llm_config_dict)
+    
     else:
-        # Default to OpenAI config if we can't determine the type
-        # You might want to add more specific logic here
-        try:
-            return OpenAILLMConfig(**llm_config_dict)
-        except Exception:
-            # If OpenAI config fails, try the base LLMConfig
-            return LLMConfig(**llm_config_dict)
+        # If openai_key is provided, use OpenAI regardless of model
+        return OpenAILLMConfig(**llm_config_dict)
+    
 
 async def process_task(config: Dict[str, Any]) -> Dict[str, Any]:
     """
