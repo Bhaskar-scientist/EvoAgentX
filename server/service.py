@@ -27,7 +27,7 @@ from .task_manager import (
 )
 from .models import ProcessResponse
 
-load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(__file__), "server", 'app.env'))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 # default_llm_config = {
