@@ -12,7 +12,10 @@ import uuid
 # Setup logger
 logger = logging.getLogger(__name__)
 from dotenv import load_dotenv
-load_dotenv(os.path.join(os.path.dirname(__file__), "server", 'app.env'))
+load_dotenv(os.path.join(os.path.dirname(__file__), 'app.env'), override=True)
+
+print(os.environ.get("SUPABASE_URL"))
+print(os.environ.get("SUPABASE_KEY"))
 
 # Abstract Database Interface
 class Database(ABC):
