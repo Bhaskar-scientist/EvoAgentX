@@ -14,9 +14,6 @@ logger = logging.getLogger(__name__)
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), 'app.env'), override=True)
 
-print(os.environ.get("SUPABASE_URL"))
-print(os.environ.get("SUPABASE_KEY"))
-
 # Abstract Database Interface
 class Database(ABC):
     """Abstract base class for database implementations."""
@@ -484,8 +481,18 @@ async def seed_database(database: Database) -> None:
             "status": "active"
         })
         
+        # Insert test_supa.py specific user (from TEST_CONFIG)
+        await database.insert("users", {
+            "user_id": "417b4875-e095-46d9-a46d-802dfef99d74",
+            "name": "Test Supa User",
+            "email": "test-supa@example.com", 
+            "role": "user",
+            "status": "active"
+        })
+        
         # Insert some sample requirements
         await database.insert("requirements", {
+            "id": "req-gaokao-2024",
             "requirement_id": "req-gaokao-2024",
             "title": "Gaokao Score Estimation System",
             "description": "Build a system to estimate Gaokao scores based on subject performance",
@@ -495,12 +502,24 @@ async def seed_database(database: Database) -> None:
         })
         
         await database.insert("requirements", {
+            "id": "req-stock-analysis",
             "requirement_id": "req-stock-analysis",
             "title": "Stock Analysis Dashboard", 
             "description": "Create a dashboard for stock price analysis and trends",
             "category": "finance",
             "status": "active",
             "goal": "Build a comprehensive stock analysis workflow with price tracking and trend analysis"
+        })
+        
+        # Insert test_supa.py specific requirement (from TEST_CONFIG)
+        await database.insert("requirements", {
+            "id": "04233f59-4670-452f-b823-c9d5560542bf",
+            "requirement_id": "04233f59-4670-452f-b823-c9d5560542bf",
+            "title": "Test Supa Requirement",
+            "description": "Test requirement for Supabase workflow lifecycle testing",
+            "category": "testing",
+            "status": "active",
+            "goal": "Analyze data and provide insights for workflow lifecycle testing"
         })
         
         # Insert some sample workflow templates
@@ -513,6 +532,7 @@ async def seed_database(database: Database) -> None:
         })
         
         logger.info("✅ Seed data inserted successfully")
+        logger.info("✅ Test-specific data for test_supa.py included")
         
     except Exception as e:
         logger.error(f"❌ Error inserting seed data: {e}")
@@ -551,7 +571,7 @@ def create_database(db_type: str = "memory", **kwargs) -> Database:
 asyncio.run(initialize_database("supabase", url=os.environ.get("SUPABASE_URL"), key=os.environ.get("SUPABASE_KEY"), table_names={"workflows": "create_x_workflows", "requirements": "create_x_project_requirements"}))
 
 
-## In-memory database for testing
+# # In-memory database for testing
 # database = create_database("memory", table_names={"workflows": "create_x_workflows", "requirements": "create_x_project_requirements"})
 # print("🌱 Seeding database with initial data...")
 # asyncio.run(seed_database(database))

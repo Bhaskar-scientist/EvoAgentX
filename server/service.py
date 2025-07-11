@@ -27,20 +27,26 @@ from .task_manager import (
 )
 from .models import ProcessResponse
 
+import sys
+import io
+import threading
+import time
+from contextlib import redirect_stdout, redirect_stderr
+
 load_dotenv(os.path.join(os.path.dirname(__file__), "server", 'app.env'))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 # default_llm_config = {
 #     "model": "gpt-4o-mini",
 #     "openai_key": OPENAI_API_KEY,
-#     "stream": True,
+#     # "stream": True,
 #     "output_response": True,
 #     "max_tokens": 16000
 # }
 default_llm_config = {
     "model": "openai/gpt-4o-mini",
     "openrouter_key": OPENROUTER_API_KEY,
-    "stream": True,
+    # "stream": True,
     "output_response": True,
     "max_tokens": 16000
 }
@@ -56,9 +62,66 @@ sudo_execution_result = None
 # Database will be initialized in main.py
 # Use the global workflow_db instance from db.py
 
-default_tools = MCPToolkit(config_path=MCP_CONFIG_PATH).get_tools()
-default_tools += [FileTool()]
-# default_tools = []
+# default_tools = MCPToolkit(config_path=MCP_CONFIG_PATH).get_tools()
+# default_tools += [FileTool()]
+default_tools = []
+
+class OutputCapture:
+    """Capture stdout and stderr output for streaming"""
+    def __init__(self):
+        self.stdout_buffer = io.StringIO()
+        self.stderr_buffer = io.StringIO()
+        self.combined_output = []
+        self.lock = threading.Lock()
+        
+    def write_stdout(self, text):
+        """Write to stdout buffer"""
+        with self.lock:
+            self.stdout_buffer.write(text)
+            self.combined_output.append(('stdout', text, time.time()))
+            
+    def write_stderr(self, text):
+        """Write to stderr buffer"""
+        with self.lock:
+            self.stderr_buffer.write(text)
+            self.combined_output.append(('stderr', text, time.time()))
+            
+    def get_new_output(self, last_index=0):
+        """Get new output since last_index"""
+        with self.lock:
+            new_output = self.combined_output[last_index:]
+            return new_output
+            
+    def get_total_output(self):
+        """Get all captured output"""
+        with self.lock:
+            return self.combined_output.copy()
+
+class StreamingStdout:
+    """Custom stdout that captures output for streaming"""
+    def __init__(self, output_capture):
+        self.output_capture = output_capture
+        self.original_stdout = sys.stdout
+        
+    def write(self, text):
+        self.original_stdout.write(text)
+        self.output_capture.write_stdout(text)
+        
+    def flush(self):
+        self.original_stdout.flush()
+
+class StreamingStderr:
+    """Custom stderr that captures output for streaming"""
+    def __init__(self, output_capture):
+        self.output_capture = output_capture
+        self.original_stderr = sys.stderr
+        
+    def write(self, text):
+        self.original_stderr.write(text)
+        self.output_capture.write_stderr(text)
+        
+    def flush(self):
+        self.original_stderr.flush()
 
 def read_tunnel_info():
     """Read tunnel information from JSON file"""
@@ -341,6 +404,113 @@ async def execute_workflow_from_config(workflow: Dict[str, Any], llm_config_dict
             "mcp_config_received": bool(mcp_config)
         }
 
+async def execute_workflow_from_config_with_capture(workflow: Dict[str, Any], llm_config_dict: Dict[str, Any], mcp_config: dict = None, inputs: Dict[str, Any] = None, output_capture: OutputCapture = None) -> Dict[str, Any]:
+    """
+    Execute a workflow with output capture for streaming.
+    Modified version of execute_workflow_from_config that captures stdout/stderr.
+    """
+    try:
+        if sudo_execution_result:
+            # Even for sudo, we can simulate some output
+            if output_capture:
+                output_capture.write_stdout("Starting sudo workflow execution...\n")
+                await asyncio.sleep(0.5)
+                output_capture.write_stdout("Initializing workflow components...\n")
+                await asyncio.sleep(0.5)
+                output_capture.write_stdout("Executing workflow logic...\n")
+                await asyncio.sleep(1)
+                output_capture.write_stdout("Workflow execution completed successfully!\n")
+                
+            return {
+                "status": "completed",
+                "message": sudo_execution_result,
+                "workflow_received": bool(workflow),
+                "llm_config_received": bool(llm_config_dict),
+                "mcp_config_received": bool(mcp_config)
+            }
+        
+        # Setup output capture
+        if output_capture:
+            streaming_stdout = StreamingStdout(output_capture)
+            streaming_stderr = StreamingStderr(output_capture)
+            
+            # Redirect stdout and stderr
+            original_stdout = sys.stdout
+            original_stderr = sys.stderr
+            sys.stdout = streaming_stdout
+            sys.stderr = streaming_stderr
+            
+            try:
+                output_capture.write_stdout("🚀 Starting workflow execution...\n")
+                
+                # Create LLM config and instance
+                output_capture.write_stdout("🔧 Creating LLM configuration...\n")
+                llm_config = create_llm_config(llm_config_dict)
+                llm = create_llm_instance(llm_config)
+                
+                # Create workflow graph
+                output_capture.write_stdout("📊 Loading workflow graph...\n")
+                workflow_graph: WorkFlowGraph = WorkFlowGraph.from_dict(workflow)
+                
+                # Setup tools
+                output_capture.write_stdout("🛠️ Setting up tools...\n")
+                if mcp_config:
+                    mcp_toolkit = MCPToolkit(config=mcp_config)
+                    tools = mcp_toolkit.get_tools()
+                    output_capture.write_stdout(f"   • Loaded {len(tools)} MCP tools\n")
+                else:
+                    tools = default_tools
+                    output_capture.write_stdout(f"   • Using {len(tools)} default tools\n")
+                
+                # Setup agent manager
+                output_capture.write_stdout("🤖 Setting up agent manager...\n")
+                agent_manager = AgentManager(tools=tools)
+                agent_manager.add_agents_from_workflow(workflow_graph, llm_config=llm_config)
+                
+                # Create and initialize workflow
+                output_capture.write_stdout("⚙️ Initializing workflow...\n")
+                workflow_instance = WorkFlow(graph=workflow_graph, agent_manager=agent_manager, llm=llm)
+                workflow_instance.init_module()
+                
+                # Execute workflow
+                output_capture.write_stdout("▶️ Executing workflow...\n")
+                if inputs:
+                    output_capture.write_stdout(f"   • Inputs: {inputs}\n")
+                
+                output = await workflow_instance.async_execute(inputs=inputs)
+                
+                output_capture.write_stdout("✅ Workflow execution completed!\n")
+                output_capture.write_stdout(f"   • Output: {str(output)[:200]}{'...' if len(str(output)) > 200 else ''}\n")
+                
+                return {
+                    "status": "completed",
+                    "message": output,
+                    "workflow_received": bool(workflow),
+                    "llm_config_received": bool(llm_config_dict),
+                    "mcp_config_received": bool(mcp_config)
+                }
+                
+            finally:
+                # Restore original stdout and stderr
+                sys.stdout = original_stdout
+                sys.stderr = original_stderr
+                
+        else:
+            # Fallback to original implementation if no output capture
+            return await execute_workflow_from_config(workflow, llm_config_dict, mcp_config, inputs)
+            
+    except Exception as e:
+        if output_capture:
+            output_capture.write_stderr(f"❌ Error in workflow execution: {str(e)}\n")
+            
+        return {
+            "status": "error",
+            "message": f"In the execution process, got error:\n{e}",
+            "workflow_received": bool(workflow),
+            "llm_config_received": bool(llm_config_dict),
+            "mcp_config_received": bool(mcp_config)
+        }
+
 
 
 def generate_project_id() -> str:
@@ -594,3 +764,217 @@ async def execute_workflow_for_project(workflow_id: str, inputs: Dict[str, Any])
     except Exception as e:
         await update_project_status(workflow_id, "failed")
         raise ValueError(f"Error executing workflow: {str(e)}")
+
+async def execute_workflow_for_project_stream(task_id: str, workflow_id: str, inputs: Dict[str, Any]):
+    """
+    Streaming version of execute_workflow_for_project.
+    Streams real command output during workflow execution.
+    """
+    output_capture = OutputCapture()
+    output_index = 0
+    
+    try:
+        # Initial setup message
+        update_stream_task(task_id, {
+            "timestamp": datetime.now().isoformat(),
+            "status": "starting",
+            "output_type": "setup",
+            "message": "Starting workflow execution...",
+            "command_output": "Initializing workflow execution stream...\n"
+        })
+        
+        # Validate workflow exists
+        workflow = await get_project(workflow_id)
+        if not workflow:
+            error_result = {
+                "status": "error",
+                "timestamp": datetime.now().isoformat(),
+                "output_type": "error",
+                "error": f"Workflow with ID {workflow_id} not found",
+                "command_output": f"ERROR: Workflow {workflow_id} not found\n"
+            }
+            update_stream_task(task_id, error_result)
+            complete_stream_task(task_id)
+            return
+
+        # Check if workflow generation was completed
+        if workflow.get("workflow_graph") is None:
+            error_result = {
+                "status": "error",
+                "timestamp": datetime.now().isoformat(),
+                "output_type": "error",
+                "error": f"Workflow {workflow_id} has not completed generation phase",
+                "command_output": f"ERROR: Workflow {workflow_id} not ready for execution\n"
+            }
+            update_stream_task(task_id, error_result)
+            complete_stream_task(task_id)
+            return
+
+        # Update workflow status
+        await update_project_status(workflow_id, "running")
+        
+        # Start output monitoring task
+        async def monitor_output():
+            nonlocal output_index
+            while True:
+                try:
+                    # Get new output every 1 second
+                    new_output = output_capture.get_new_output(output_index)
+                    
+                    if new_output:
+                        # Format the output for streaming
+                        command_output = ""
+                        for output_type, text, timestamp in new_output:
+                            command_output += text
+                            
+                        # Send update with new command output
+                        update_stream_task(task_id, {
+                            "timestamp": datetime.now().isoformat(),
+                            "status": "running",
+                            "output_type": "command",
+                            "command_output": command_output,
+                            "total_output_lines": len(output_capture.get_total_output())
+                        })
+                        
+                        output_index += len(new_output)
+                    
+                    await asyncio.sleep(1)  # Check every 1 second
+                    
+                except Exception as e:
+                    print(f"Error monitoring output: {e}")
+                    break
+        
+        # Start monitoring task
+        monitor_task = asyncio.create_task(monitor_output())
+        
+        try:
+            # Execute the workflow with output capture
+            workflow_graph = workflow["workflow_graph"]
+            
+            execution_result = await execute_workflow_from_config_with_capture(
+                workflow_graph, 
+                default_llm_config, 
+                mcp_config={}, 
+                inputs=inputs,
+                output_capture=output_capture
+            )
+            
+            # Cancel monitoring task
+            monitor_task.cancel()
+            
+            # Send any remaining output
+            remaining_output = output_capture.get_new_output(output_index)
+            if remaining_output:
+                command_output = ""
+                for output_type, text, timestamp in remaining_output:
+                    command_output += text
+                    
+                update_stream_task(task_id, {
+                    "timestamp": datetime.now().isoformat(),
+                    "status": "running",
+                    "output_type": "command",
+                    "command_output": command_output,
+                    "total_output_lines": len(output_capture.get_total_output())
+                })
+            
+            if execution_result is None:
+                await update_project_status(workflow_id, "failed")
+                error_result = {
+                    "status": "error",
+                    "timestamp": datetime.now().isoformat(),
+                    "output_type": "error",
+                    "error": "Failed to execute workflow",
+                    "command_output": "ERROR: Workflow execution failed\n"
+                }
+                update_stream_task(task_id, error_result)
+                complete_stream_task(task_id)
+                return
+
+            # Process execution result (same logic as original function)
+            if isinstance(execution_result, dict):
+                execution_message = execution_result.get("message", "")
+            else:
+                execution_message = str(execution_result)
+                
+            # Clean up markdown formatting from the message
+            if isinstance(execution_message, str):
+                if execution_message.startswith("```markdown"):
+                    execution_message = execution_message[11:]
+                if execution_message.endswith("```"):
+                    execution_message = execution_message[:-3]
+            
+            # Update execution_result with cleaned message
+            if isinstance(execution_result, dict):
+                execution_result["message"] = execution_message
+            else:
+                execution_result = execution_message
+            
+            # Update workflow storage with execution results
+            await update_project_status(
+                workflow_id, 
+                "completed",
+                execution_result=execution_result
+            )
+            
+            # Final result with complete output
+            total_output = output_capture.get_total_output()
+            complete_command_output = ""
+            for output_type, text, timestamp in total_output:
+                complete_command_output += text
+                
+            final_result = {
+                "status": "completed",
+                "timestamp": datetime.now().isoformat(),
+                "output_type": "completion",
+                "workflow_id": workflow_id,
+                "execution_result": execution_result,
+                "command_output": complete_command_output,
+                "total_output_lines": len(total_output),
+                "message": "Workflow execution completed successfully"
+            }
+            
+            update_stream_task(task_id, final_result)
+            complete_stream_task(task_id)
+            
+        except Exception as e:
+            # Cancel monitoring task
+            monitor_task.cancel()
+            raise e
+            
+    except Exception as e:
+        # Handle errors
+        await update_project_status(workflow_id, "failed")
+        error_result = {
+            "status": "error",
+            "timestamp": datetime.now().isoformat(),
+            "output_type": "error",
+            "error": f"Error executing workflow: {str(e)}",
+            "workflow_id": workflow_id,
+            "command_output": f"ERROR: {str(e)}\n"
+        }
+        update_stream_task(task_id, error_result)
+        complete_stream_task(task_id)
+
+async def start_streaming_workflow_execution(workflow_id: str, inputs: Dict[str, Any]) -> Dict[str, Any]:
+    """Start a new streaming workflow execution task"""
+    task_id = str(uuid.uuid4())
+    
+    # Initialize the stream task
+    config = {
+        "task_type": "workflow_execution",
+        "workflow_id": workflow_id,
+        "inputs": inputs,
+        "timeout": 300  # 1 hour timeout by default
+    }
+    create_stream_task(task_id, config)
+    
+    # Start the streaming workflow execution
+    asyncio.create_task(execute_workflow_for_project_stream(task_id, workflow_id, inputs))
+    
+    return {
+        "task_id": task_id,
+        "status": "started",
+        "stream_url": f"/stream/{task_id}",
+        "task_type": "workflow_execution",
+        "workflow_id": workflow_id
+    }

@@ -1,0 +1,9 @@
+# Only exclude the most obvious things
+.git
+node_modules/
+*.pyc
+__pycache__/
+.pytest_cache/
+.coverage
+logs/
+.tmp/ 

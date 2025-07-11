@@ -1,5 +1,6 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from sse_starlette.sse import EventSourceResponse
+from typing import Dict, Any, Optional, List
 import json
 import asyncio
 import uuid
@@ -13,7 +14,7 @@ from .models import (
 )
 from .service import (
     handle_process_request, start_streaming_task, setup_project, get_project, list_projects, 
-    generate_workflow_for_project, execute_workflow_for_project
+    generate_workflow_for_project, execute_workflow_for_project, start_streaming_workflow_execution
 )
 from .db import initialize_database, close_database, seed_database
 from .task_manager import (
@@ -272,6 +273,95 @@ async def stream_results(task_id: str):
     return EventSourceResponse(
         event_generator(task_id, timeout=task_config["timeout"])
     )
+
+@app.post("/workflow/execute_stream")
+async def execute_workflow_for_project_stream_api(request: ProjectWorkflowExecutionRequest):
+    """
+    Phase 3: Execute workflow with provided inputs (Streaming version).
+    Returns stream information to connect to the execution stream.
+    """
+    try:
+        result = await start_streaming_workflow_execution(request.workflow_id, request.inputs)
+        return {
+            "task_id": result["task_id"],
+            "status": result["status"],
+            "stream_url": result["stream_url"],
+            "workflow_id": result["workflow_id"],
+            "message": f"Workflow execution started. Connect to {result['stream_url']} to receive real-time updates."
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error starting workflow execution stream: {str(e)}")
+
+@app.websocket("/ws/workflow/{task_id}")
+async def websocket_endpoint(websocket: WebSocket, task_id: str):
+    """
+    WebSocket endpoint for streaming workflow execution updates.
+    """
+    await websocket.accept()
+    
+    try:
+        start_time = datetime.now()
+        last_index = 0
+        
+        while True:
+            # Check if task exists
+            if not get_stream_task(task_id):
+                await websocket.send_json({
+                    "event": "error",
+                    "data": {"error": "Task not found"}
+                })
+                break
+                
+            # Get new updates
+            updates = get_stream_task_updates(task_id, last_index)
+            for update in updates:
+                event_type = "update" if not is_stream_task_completed(task_id) else "complete"
+                await websocket.send_json({
+                    "event": event_type,
+                    "data": update
+                })
+                last_index += 1
+                
+            # If task is completed, end stream
+            if is_stream_task_completed(task_id):
+                break
+                
+            # Wait before checking for new updates
+            await asyncio.sleep(0.5)
+            
+    except WebSocketDisconnect:
+        print(f"WebSocket client disconnected: {task_id}")
+    except Exception as e:
+        try:
+            await websocket.send_json({
+                "event": "error",
+                "data": {"error": str(e)}
+            })
+        except:
+            pass
+    finally:
+        try:
+            await websocket.close()
+        except:
+            pass
+
+@app.post("/workflow/execute_ws")
+async def execute_workflow_for_project_ws_api(request: ProjectWorkflowExecutionRequest):
+    """
+    Phase 3: Execute workflow with provided inputs (WebSocket version).
+    Returns WebSocket connection information.
+    """
+    try:
+        result = await start_streaming_workflow_execution(request.workflow_id, request.inputs)
+        return {
+            "task_id": result["task_id"],
+            "status": result["status"],
+            "ws_url": f"/ws/workflow/{result['task_id']}",  # WebSocket URL instead of SSE
+            "workflow_id": result["workflow_id"],
+            "message": f"Workflow execution started. Connect to WebSocket at /ws/workflow/{result['task_id']} for real-time updates."
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error starting workflow execution: {str(e)}")
 
 @app.get("/health")
 async def health_check():
