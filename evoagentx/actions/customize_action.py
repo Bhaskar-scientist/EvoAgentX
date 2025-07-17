@@ -1,5 +1,5 @@
 from pydantic import Field
-from typing import Optional, Any, Callable, List, Union, Dict
+from typing import Optional, Any, Callable, List, Union
 import re
 import json
 
@@ -7,8 +7,9 @@ from ..core.logging import logger
 from ..models.base_model import BaseLLM
 from .action import Action
 from ..core.message import Message
+from ..prompts.template import StringTemplate, ChatTemplate
 from ..prompts.tool_calling import OUTPUT_EXTRACTION_PROMPT, TOOL_CALLING_TEMPLATE, TOOL_CALLING_HISTORY_PROMPT
-from ..tools.tool import Tool
+from ..tools.tool import Toolkit
 from ..core.registry import MODULE_REGISTRY
 from ..models.base_model import LLMOutputParser
 from ..core.module_utils import parse_json_from_llm_output, parse_json_from_text
@@ -20,9 +21,7 @@ class CustomizeAction(Action):
     title_format: Optional[str] = Field(default="## {title}", exclude=True, description="the format of the title. It is used when the `parse_mode` is 'title'.")
     custom_output_format: Optional[str] = Field(default=None, exclude=True, description="the format of the output. It is used when the `prompt_template` is provided.")
 
-    tools_schema: Optional[Dict[str, Any]] = Field(default=None, description="Schema definitions for available tools")
-    tools_caller: Optional[Dict[str, Callable]] = Field(default=None, description="Mapping of tool names to their callable functions")
-    tool_calling_instructions: Optional[List[str]] = Field(default=None, description="Additional instructions for tool calling")
+    tools: Optional[List[Toolkit]] = Field(default=None, description="The tools that the action can use")
     conversation: Optional[Message] = Field(default=None, description="Current conversation state")
 
     max_tool_try: int = Field(default=2, description="Maximum number of tool calling attempts allowed")
@@ -40,6 +39,9 @@ class CustomizeAction(Action):
         # Prioritize template and give warning if both are provided
         if self.prompt and self.prompt_template:
             logger.warning("Both `prompt` and `prompt_template` are provided for CustomizeAction action. Prioritizing `prompt_template` and ignoring `prompt`.")
+        if self.tools:
+            self.tools_caller = {}
+            self.add_tools(self.tools)
     
     def prepare_action_prompt(
         self, 
@@ -81,7 +83,8 @@ class CustomizeAction(Action):
         if self.prompt:
             prompt = self.prompt.format(**prompt_params_values) if prompt_params_values else self.prompt
             if self.tools:
-                prompt += "\n\n" + TOOL_CALLING_TEMPLATE.format(tools_description = self.tools_schema, additional_context = self.tool_calling_instructions)
+                tools_schemas = [j["function"] for i in [tool.get_tool_schemas() for tool in self.tools] for j in i]
+                prompt += "\n\n" + TOOL_CALLING_TEMPLATE.format(tools_description = tools_schemas)
             return prompt
         else:
             # Use goal-based tool calling mode
@@ -131,35 +134,67 @@ class CustomizeAction(Action):
             i += 1 
         return unique_name 
     
-    def add_tools(self, tools: List[Tool]):
-        if not self.tools_schema:
-            self.tools_schema = {}
-            self.tools_caller = {}
-            self.tool_calling_instructions = []
-            self.tools = []
+    def add_tools(self, tools: Union[Toolkit, List[Toolkit]]):
         if not tools:
             return
-        self.tools += tools
-        tools_schemas = [tool.get_tool_schemas() for tool in tools]
-        tools_schemas = [j for i in tools_schemas for j in i]
-        tools_callers = [tool.get_tools() for tool in tools]
-        tools_callers = [j for i in tools_callers for j in i]
-        tools_names = [i["function"]["name"] for i in tools_schemas]
-        self.tool_calling_instructions += [tool.get_tool_prompt() for tool in tools]
-        for tool_schema, tool_caller, tool_name in zip(tools_schemas, tools_callers, tools_names):
-            self.tools_schema[tool_name] = tool_schema
-            self.tools_caller[tool_name] = tool_caller
+        if isinstance(tools,Toolkit):
+            tools = [tools]
+        if not all(isinstance(tool, Toolkit) for tool in tools):
+            raise TypeError("`tools` must be a Toolkit or list of Toolkit instances.")
+        if not self.tools:
+            self.tools_caller = {}
+            self.tools = []
+        # self.tools += tools
+        # tools_callers = [tool.get_tools() for tool in tools]
+        # tools_callers = [j for i in tools_callers for j in i]
+        # for tool_caller in tools_callers:
+        #     self.tools_caller[tool_caller.name] = tool_caller
+
+        # avoid duplication & type checks 
+        for toolkit in tools:
+            try:
+                tool_callers = toolkit.get_tools()
+                if not isinstance(tool_callers, list):
+                    logger.warning(f"Expected list of tool functions from '{toolkit.name}.get_tools()', got {type(tool_callers)}.")
+                    continue 
+                
+                # add tool callers to the tools_caller dictionary
+                valid_tools_count = 0 
+                valid_tools_names, valid_tool_callers = [], []
+                for tool_caller in tool_callers:
+                    tool_caller_name = getattr(tool_caller, "name", None)
+                    if not tool_caller_name or not callable(tool_caller):
+                        logger.warning(f"Invalid tool function in '{toolkit.name}': missing name or not callable.")
+                        continue
+                    if tool_caller_name in self.tools_caller:
+                        logger.warning(f"Duplicate tool function '{tool_caller_name}' detected. Overwriting previous function.")
+                    # self.tools_caller[tool_caller_name] = tool_caller
+                    valid_tools_count += 1
+                    valid_tools_names.append(tool_caller_name)
+                    valid_tool_callers.append(tool_caller)
+
+                if valid_tools_count == 0:
+                    logger.info(f"No valid tools found in toolkit '{toolkit.name}'. Skipping.")
+                    continue 
+
+                if valid_tools_count > 0 and all(name in self.tools_caller for name in valid_tools_names):
+                    logger.info(f"All tools from toolkit '{toolkit.name}' are already added. Skipping.")
+                    continue
+                
+                if valid_tools_count > 0:
+                    self.tools_caller.update({name: caller for name, caller in zip(valid_tools_names, valid_tool_callers)}) 
+                
+                # only add toolkit if at least one valid tool is added and toolkit is not already added 
+                existing_toolkit_names = {tkt.name for tkt in self.tools}
+                if valid_tools_count > 0 and toolkit.name not in existing_toolkit_names:
+                    self.tools.append(toolkit)
+                if valid_tools_count > 0:
+                    logger.info(f"Added toolkit '{toolkit.name}' with {valid_tools_count} valid tools in {self.name}: {valid_tools_names}.")
+            
+            except Exception as e:
+                logger.error(f"Failed to load tools from toolkit '{toolkit.name}': {e}")
     
     def _extract_tool_calls(self, llm_output: str) -> List[dict]:
-        # if match := re.search(r"```(?:ToolCalling)?\s*\n(.*?)\n```", llm_output, re.DOTALL):
-        #     json_list = parse_json_from_text(match.group(1))
-        #     return json.loads(json_list[0] if json_list else "{}")
-
-        # Improved regex pattern to match ```ToolCalling blocks more accurately
-        # This pattern handles:
-        # - Optional whitespace after ToolCalling
-        # - Content capture with proper handling of newlines
-        # - Optional whitespace before closing ```
         pattern = r"```ToolCalling\s*\n(.*?)\n\s*```"
         
         # Find all ToolCalling blocks in the output
@@ -202,9 +237,9 @@ class CustomizeAction(Action):
         # If no output fields are defined, create a simple content-only output
         if not output_attrs:
             # Create output with just the content field
-            output = self.outputs_format(content=llm_output_content)
-            print("Created simple content output for agent with no defined outputs:")
-            print(output)
+            output = self.outputs_format.parse(content=llm_output_content)
+            # print("Created simple content output for agent with no defined outputs:")
+            # print(output)
             return output
         
         # Use the action's parse_mode and parse_func for parsing
@@ -217,32 +252,29 @@ class CustomizeAction(Action):
                 title_format=getattr(self, 'title_format', "## {title}")
             )
             
-            print("Successfully parsed output using action's parse settings:")
-            print(parsed_output)
+            # print("Successfully parsed output using action's parse settings:")
+            # print(parsed_output)
             return parsed_output
             
         except Exception as e:
-            print(f"Failed to parse with action's parse settings: {e}")
-            print("Falling back to extraction prompt...")
+            logger.info(f"Failed to parse with action's parse settings: {e}")
+            logger.info("Falling back to using LLM to extract outputs...")
             
             # Fall back to extraction prompt if direct parsing fails
             extraction_prompt = self.prepare_extraction_prompt(llm_output_content)
                 
-            llm_extracted_output: LLMOutputParser = llm.generate(prompt=extraction_prompt, history=kwargs.get("history", []) + [llm_output_content])
+            llm_extracted_output: LLMOutputParser = llm.generate(prompt=extraction_prompt)
             llm_extracted_data: dict = parse_json_from_llm_output(llm_extracted_output.content)
             output = self.outputs_format.from_dict(llm_extracted_data)
             
-            print("Extracted output using fallback:")
-            print(output)
-            
+            # print("Extracted output using fallback:")
+            # print(output)
             return output
     
     async def _async_extract_output(self, llm_output: Any, llm: BaseLLM = None, **kwargs):
+        
         # Get the raw output content
-        if hasattr(llm_output, 'content'):
-            llm_output_content = llm_output.content
-        else:
-            llm_output_content = str(llm_output)
+        llm_output_content = getattr(llm_output, "content", str(llm_output))
         
         # Check if there are any defined output fields
         output_attrs = self.outputs_format.get_attrs()
@@ -250,9 +282,9 @@ class CustomizeAction(Action):
         # If no output fields are defined, create a simple content-only output
         if not output_attrs:
             # Create output with just the content field
-            output = self.outputs_format(content=llm_output_content)
-            print("Created simple content output for agent with no defined outputs:")
-            print(output)
+            output = self.outputs_format.parse(content=llm_output_content)
+            # print("Created simple content output for agent with no defined outputs:")
+            # print(output)
             return output
         
         # Use the action's parse_mode and parse_func for parsing
@@ -265,24 +297,23 @@ class CustomizeAction(Action):
                 title_format=getattr(self, 'title_format', "## {title}")
             )
             
-            print("Successfully parsed output using action's parse settings:")
-            print(parsed_output)
+            # print("Successfully parsed output using action's parse settings:")
+            # print(parsed_output)
             return parsed_output
             
         except Exception as e:
-            print(f"Failed to parse with action's parse settings: {e}")
-            print("Falling back to extraction prompt...")
+            logger.info(f"Failed to parse with action's parse settings: {e}")
+            logger.info("Falling back to using LLM to extract outputs...")
             
             # Fall back to extraction prompt if direct parsing fails
             extraction_prompt = self.prepare_extraction_prompt(llm_output_content)
                 
-            llm_extracted_output = await llm.async_generate(prompt=extraction_prompt, history=kwargs.get("history", []) + [llm_output_content])
+            llm_extracted_output = await llm.async_generate(prompt=extraction_prompt)
             llm_extracted_data: dict = parse_json_from_llm_output(llm_extracted_output.content)
             output = self.outputs_format.from_dict(llm_extracted_data)
             
-            print("Extracted output using fallback:")
-            print(output)
-            
+            # print("Extracted output using fallback:")
+            # print(output)
             return output
     
     def _calling_tools(self, tool_call_args) -> dict:
@@ -313,7 +344,7 @@ class CustomizeAction(Action):
                 try:
                     # Determine if the function is async or not
                     print("_____________________ Start Function Calling _____________________")
-                    print(f"Executing function calling: {function_name} with {function_args}")
+                    print(f"Executing function calling: {function_name} with parameters: {function_args}")
                     result = callable_fn(**function_args)
                 
                 except Exception as e:
@@ -343,7 +374,14 @@ class CustomizeAction(Action):
         final_llm_response = None
         
         if self.prompt_template:
-            conversation = [{"role": "system", "content": self.prepare_action_prompt(inputs=inputs, system_prompt=sys_msg)}]
+
+            if isinstance(self.prompt_template, ChatTemplate):
+                # must determine whether prompt_template is ChatTemplate first since ChatTemplate is a subclass of StringTemplate
+                conversation = self.prepare_action_prompt(inputs=inputs, system_prompt=sys_msg)
+            elif isinstance(self.prompt_template, StringTemplate):
+                conversation = [{"role": "system", "content": self.prepare_action_prompt(inputs=inputs, system_prompt=sys_msg)}]
+            else:
+                raise ValueError(f"`prompt_template` must be a StringTemplate or ChatTemplate instance, but got {type(self.prompt_template)}")
         else:
             conversation = [{"role": "system", "content": sys_msg}, {"role": "user", "content": self.prepare_action_prompt(inputs=inputs, system_prompt=sys_msg)}]
         
@@ -373,13 +411,13 @@ class CustomizeAction(Action):
             if not tool_call_args:
                 break
             
-            print("Extracted tool call args:")
-            print(tool_call_args)
+            logger.info("Extracted tool call args:")
+            logger.info(json.dumps(tool_call_args, indent=4))
             
             results = self._calling_tools(tool_call_args)
             
-            print("results:")
-            print(results)
+            logger.info("Tool call results:")
+            logger.info(json.dumps(results, indent=4))
             
             conversation.append({"role": "assistant", "content": TOOL_CALLING_HISTORY_PROMPT.format(
                 iteration_number=time_out,
@@ -408,7 +446,13 @@ class CustomizeAction(Action):
         final_llm_response = None
         
         if self.prompt_template:
-            conversation = [{"role": "system", "content": self.prepare_action_prompt(inputs=inputs, system_prompt=sys_msg)}]
+            if isinstance(self.prompt_template, ChatTemplate):
+                # must determine whether prompt_template is ChatTemplate first since ChatTemplate is a subclass of StringTemplate
+                conversation = self.prepare_action_prompt(inputs=inputs, system_prompt=sys_msg)
+            elif isinstance(self.prompt_template, StringTemplate):
+                conversation = [{"role": "system", "content": self.prepare_action_prompt(inputs=inputs, system_prompt=sys_msg)}]
+            else:
+                raise ValueError(f"`prompt_template` must be a StringTemplate or ChatTemplate instance, but got {type(self.prompt_template)}")
         else:
             conversation = [{"role": "system", "content": sys_msg}, {"role": "user", "content": self.prepare_action_prompt(inputs=inputs, system_prompt=sys_msg)}]
         
@@ -438,14 +482,13 @@ class CustomizeAction(Action):
             if not tool_call_args:
                 break
             
-            print("Extracted tool call args:")
-            print(tool_call_args)
+            logger.info("Extracted tool call args:")
+            logger.info(json.dumps(tool_call_args, indent=4))
             
             results = self._calling_tools(tool_call_args)
             
-            
-            print("results:")
-            print(results)
+            logger.info("Tool call results:")
+            logger.info(json.dumps(results, indent=4))
             
             conversation.append({"role": "assistant", "content": TOOL_CALLING_HISTORY_PROMPT.format(
                 iteration_number=time_out,

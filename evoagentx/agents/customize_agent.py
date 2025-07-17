@@ -1,7 +1,7 @@
 import json
 import inspect
 from pydantic import create_model, Field
-from typing import Union, Optional, Callable, Type, List
+from typing import Optional, Callable, Type, List, Any, Union, Dict
 
 from .agent import Agent
 from ..core.logging import logger
@@ -14,8 +14,8 @@ from ..prompts.template import PromptTemplate
 from ..actions.action import Action, ActionOutput
 from ..utils.utils import generate_dynamic_class_name, make_parent_folder
 from ..actions.customize_action import CustomizeAction
-from ..tools.tool import Tool
 from ..actions.action import ActionInput
+from ..tools.tool import Toolkit, Tool
 
 
 class CustomizeAgent(Agent):
@@ -55,7 +55,7 @@ class CustomizeAgent(Agent):
             Must accept a "content" parameter and return a dictionary.
         title_format (str, optional): Format string for title parsing mode with {title} placeholder.
             Default is "## {title}".
-        tools (list[Tool], optional): List of tools to be used by the agent.
+        tools (list[Toolkit], optional): List of tools to be used by the agent.
         max_tool_calls (int, optional): Maximum number of tool calls. Defaults to 5. 
         custom_output_format (str, optional): Specify the output format. Only used when `prompt_template` is used. 
             If not provided, the output format will be constructed from the `outputs` specification and `parse_mode`. 
@@ -74,7 +74,7 @@ class CustomizeAgent(Agent):
         parse_mode: Optional[str] = "title", 
         parse_func: Optional[Callable] = None, 
         title_format: Optional[str] = None, 
-        tools: Optional[List[Tool]] = None,
+        tools: Optional[List[Union[Toolkit, Tool]]] = None,
         max_tool_calls: Optional[int] = 5,
         custom_output_format: Optional[str] = None, 
         **kwargs
@@ -82,6 +82,11 @@ class CustomizeAgent(Agent):
         system_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
         inputs = inputs or [] 
         outputs = outputs or [] 
+        if tools is not None:
+            raw_tool_map = {tool.name: tool for tool in tools}
+            tools = [tool if isinstance(tool, Toolkit) else Toolkit(name=tool.name, tools=[tool]) for tool in tools]
+        else:
+            raw_tool_map = None
 
         if prompt is not None and prompt_template is not None:
             logger.warning("Both `prompt` and `prompt_template` are provided in `CustomizeAgent`. `prompt_template` will be used.")
@@ -134,7 +139,7 @@ class CustomizeAgent(Agent):
             actions=[customize_action], 
             **kwargs
         )
-        self._store_inputs_outputs_info(inputs, outputs)
+        self._store_inputs_outputs_info(inputs, outputs, raw_tool_map)
         self.output_parser = output_parser 
         self.parse_mode = parse_mode 
         self.parse_func = parse_func 
@@ -143,7 +148,7 @@ class CustomizeAgent(Agent):
         self.max_tool_calls = max_tool_calls
         self.custom_output_format = custom_output_format
 
-    def _add_tools(self, tools: list[Tool]):
+    def _add_tools(self, tools: List[Toolkit]):
         self.get_action(self.customize_action_name).add_tools(tools)
 
     @property
@@ -178,6 +183,16 @@ class CustomizeAgent(Agent):
             The prompt for the primary custom action
         """
         return self.action.prompt
+    
+    @property
+    def prompt_template(self) -> PromptTemplate:
+        """
+        Get the prompt template for the primary custom action.
+        
+        Returns:
+            The prompt template for the primary custom action
+        """
+        return self.action.prompt_template
     
     def validate_data(self, prompt: str, prompt_template: PromptTemplate, inputs: List[dict], outputs: List[dict], output_parser: Type[ActionOutput], parse_mode: str, parse_func: Callable, title_format: str):
 
@@ -239,7 +254,7 @@ class CustomizeAgent(Agent):
         output_parser: Optional[ActionOutput] = None,
         title_format: Optional[str] = "## {title}",
         custom_output_format: Optional[str] = None,
-        tools: Optional[List[Tool]] = None,
+        tools: Optional[List[Toolkit]] = None,
         max_tool_calls: Optional[int] = 5
     ) -> Action:
         """Create a custom action based on the provided specifications.
@@ -290,9 +305,9 @@ class CustomizeAgent(Agent):
             for field in outputs:
                 required = field.get("required", True)
                 if required:
-                    action_output_fields[field["name"]] = (Union[str, dict, list], Field(description=field["description"]))
+                    action_output_fields[field["name"]] = (Any, Field(description=field["description"]))
                 else:
-                    action_output_fields[field["name"]] = (Optional[Union[str, dict, list]], Field(default=None, description=field["description"]))
+                    action_output_fields[field["name"]] = (Optional[Any], Field(default=None, description=field["description"]))
             action_output_type = create_model(
                 self._get_unique_class_name(
                     generate_dynamic_class_name(name+" action_output")
@@ -327,12 +342,10 @@ class CustomizeAgent(Agent):
             parse_func=parse_func,
             title_format=title_format,
             custom_output_format=custom_output_format,
-            max_tool_try=max_tool_calls
+            max_tool_try=max_tool_calls,
+            tools=tools
         )
 
-        if tools:
-            customize_action.add_tools(tools)
-        
         return customize_action
     
     def _check_output_parser(self, outputs: List[dict], output_parser: Type[ActionOutput]):
@@ -355,7 +368,7 @@ class CustomizeAgent(Agent):
                     f"All the fields in the output parser must be present in the outputs." 
                 )
     
-    def _store_inputs_outputs_info(self, inputs: List[dict], outputs: List[dict]):
+    def _store_inputs_outputs_info(self, inputs: List[dict], outputs: List[dict], tool_map: Dict[str, Union[Toolkit, Tool]]):
 
         self._action_input_types, self._action_input_required = {}, {} 
         for field in inputs:
@@ -367,6 +380,7 @@ class CustomizeAgent(Agent):
             required = field.get("required", True)
             self._action_output_types[field["name"]] = field["type"]
             self._action_output_required[field["name"]] = required
+        self._raw_tool_map = tool_map
     
     def __call__(self, inputs: dict = None, return_msg_type: MessageType = MessageType.UNKNOWN, **kwargs) -> Message:
         """
@@ -428,10 +442,10 @@ class CustomizeAgent(Agent):
         return config
     
     @classmethod
-    def load_module(cls, path: str, llm_config: LLMConfig = None, tool_dict: dict = None, **kwargs) -> "CustomizeAgent":
+    def load_module(cls, path: str, llm_config: LLMConfig = None, tools: List[Union[Toolkit, Tool]] = None, **kwargs) -> "CustomizeAgent":
         """
         load the agent from local storage. Must provide `llm_config` when loading the agent from local storage. 
-            If tool_names is provided, tool_dict must also be provided. 
+            If tools is provided, tool_names must also be provided. 
 
         Args:
             path: The path of the file
@@ -442,8 +456,14 @@ class CustomizeAgent(Agent):
         Returns:
             CustomizeAgent: The loaded agent instance
         """
+        match_dict = {}
         agent = super().load_module(path=path, llm_config=llm_config, **kwargs)
-        agent["tools"] = [tool_dict[tool_name] for tool_name in agent["tool_names"]]
+        if tools:
+            match_dict = {tool.name:tool for tool in tools}
+        if agent.get("tool_names", None):
+            assert tools is not None, "must provide `tools: List[Union[Toolkit, Tool]]` when using `load_module` or `from_file` to load the agent from local storage and `tool_names` is not None or empty"
+            added_tools = [match_dict[tool_name] for tool_name in agent["tool_names"]]
+            agent["tools"] = [tool if isinstance(tool, Toolkit) else Toolkit(name=tool.name, tools=[tool]) for tool in added_tools]
         return agent 
     
     def save_module(self, path: str, ignore: List[str] = [], **kwargs)-> str:
@@ -495,6 +515,8 @@ class CustomizeAgent(Agent):
         """
         config = self.get_customize_agent_info()
         config["llm_config"] = self.llm_config.to_dict()
-        config["tool_dict"] = {tool.name: tool for tool in self.tools}
-        return config 
+        tool_names = config.pop("tool_names", None)
+        if tool_names:
+            config["tools"] = [self._raw_tool_map[name] for name in tool_names]
+        return config
     

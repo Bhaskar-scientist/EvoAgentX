@@ -14,10 +14,9 @@ FastMCP 2.0 Integration Notes:
 """
 import threading
 import asyncio
-from pydantic import Field
 from functools import partial
 from typing import Optional, Any, List, Dict, Callable, Union
-from evoagentx.tools.tool import Tool
+from evoagentx.tools.tool import Tool,Toolkit
 from evoagentx.core.logging import logger
 from contextlib import AsyncExitStack, asynccontextmanager
 
@@ -27,32 +26,95 @@ from fastmcp.exceptions import ClientError, McpError
 import json
 
 class MCPTool(Tool):
-    descriptions: List[str] = Field(default_factory=list, description="A list of descriptions for the tool")
-    schemas: List[dict[str, Any]] = Field(default_factory=list, description="A list of schemas for the tool")
-    tools: List[Callable] = Field(default_factory=list, description="A list of tools for the tool")
-
-    def __init__(
-        self,
-        name: str = "MCPTool",
-        descriptions: List[str] = ["Default MCP Tool description"],
-        schemas: List[dict[str, Any]] = [],
-        tools: List[Callable] = [],
-    ):
-        super().__init__(
-            name=name,
-            descriptions=descriptions,
-            schemas=schemas,
-            tools=tools
-        )
-
-    def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return self.schemas
+    name: str = "MCPTool"
+    description: str = "MCP tool wrapper"
+    inputs: Dict[str, Dict[str, Any]] = {}
+    required: Optional[List[str]] = None
+    function: Callable = None
     
-    def get_tool_descriptions(self) -> List[str]:
-        return self.descriptions
+    def __init__(self, name: str, description: str, inputs: Dict[str, Dict[str, str]], required: Optional[List[str]] = None, function: Callable = None):
+        super().__init__(name=name, description=description, inputs=inputs, required=required)
+        self.function = function
     
-    def get_tools(self) -> List[Callable]:
-        return self.tools
+    @property
+    def __name__(self):
+        return self.name
+    
+    def __call__(self, **kwargs):
+        if not self.function:
+            raise ValueError("Function not set for MCPTool")
+        result = self.function(**kwargs)
+        return self._convert_result(result)
+    
+    def _convert_result(self, result: Any) -> Any:
+        """
+        Convert MCP tool results to JSON-serializable format.
+        Handles complex objects like Anthropic's TextContent, ImageContent, etc.
+        """
+        if result is None:
+            return None
+        
+        # Handle primitive types
+        if isinstance(result, (str, int, float, bool)):
+            return result
+        
+        # Handle lists
+        if isinstance(result, list):
+            return [self._convert_result(item) for item in result]
+        
+        # Handle dictionaries
+        if isinstance(result, dict):
+            return {key: self._convert_result(value) for key, value in result.items()}
+        
+        # Handle Anthropic content types by name (avoid import dependencies)
+        obj_type = type(result).__name__
+        if obj_type == "TextContent":
+            if hasattr(result, 'text'):
+                return result.text
+            elif hasattr(result, 'content'):
+                return result.content
+            else:
+                return str(result)
+        
+        elif obj_type in ["ImageContent", "ToolUseContent", "ToolResultContent"]:
+            # For these types, return a structured representation
+            if hasattr(result, '__dict__'):
+                return self._convert_result(result.__dict__)
+            else:
+                return str(result)
+        
+        # Handle other objects with text/content attributes
+        if hasattr(result, 'text'):
+            return result.text
+        elif hasattr(result, 'content'):
+            return result.content
+        
+        # Handle objects with __dict__ (convert to dictionary)
+        if hasattr(result, '__dict__'):
+            return self._convert_result(result.__dict__)
+        
+        # Fallback to string representation
+        return str(result)
+    
+    @classmethod
+    def validate_attributes(cls):
+        required_attributes = {
+            "name": str,
+            "description": str,
+            "inputs": dict
+        }
+        
+        for attr, attr_type in required_attributes.items():
+            if not hasattr(cls, attr):
+                raise ValueError(f"Attribute {attr} is required")
+            if not isinstance(getattr(cls, attr), attr_type):
+                raise ValueError(f"Attribute {attr} must be of type {attr_type}")
+
+        if cls.required:
+            for required_input in cls.required:
+                if required_input not in cls.inputs:
+                    raise ValueError(f"Required input '{required_input}' is not found in inputs")
+
 
 class MCPClient:
     def __init__(
@@ -93,7 +155,7 @@ class MCPClient:
     
     def __enter__(self):
         self._connect()
-        return self.get_tools()
+        return self.get_toolkits()
     
     def __del__(self):
         self._disconnect()
@@ -144,8 +206,7 @@ class MCPClient:
         session: Client,
         mcp_tools: List[Any],  # List of FastMCP tool objects for a single server
         config: Dict[str, Any],
-    ) -> MCPTool:
-        """Create a single MCPTool that encapsulates all tools from a server."""
+    ) ->Toolkit:
         # Define the sync call function once
         def _sync_call_tool(name: str, **kwargs) -> Any:
             try:
@@ -169,49 +230,40 @@ class MCPClient:
                 raise
 
         # Collect all schemas and descriptions
-        all_schemas = []
-        all_descriptions = []
-        all_functions = []
+        all_tools = []
 
         for mcp_tool in mcp_tools:
             input_schema = getattr(mcp_tool, 'inputSchema', {})
             if not input_schema and hasattr(mcp_tool, 'input_schema'):
                 input_schema = mcp_tool.input_schema
-                
+            
             properties = input_schema.get("properties", {})
             required = input_schema.get("required", [])
-
-            parameters = {
-                "type": "object",
-                "properties": properties,
-                "required": required,
-            }
-
-            schema = {
-                "type": "function",
-                "function": {
-                    "name": mcp_tool.name,
-                    "description": getattr(mcp_tool, 'description', None) or "No description provided.",
-                    "parameters": parameters,
-                },
-            }
             
-            all_schemas.append(schema)
-            all_descriptions.append(getattr(mcp_tool, 'description', None) or "")
-            all_functions.append(partial(_sync_call_tool, mcp_tool.name))
+            # Convert MCP properties to Tool.inputs format
+            # Tool.inputs expects Dict[str, Dict[str, str]] format
+            
+            inputs = properties
+            
+            # Create the partial function and add __name__ attribute
+            partial_func = partial(_sync_call_tool, mcp_tool.name)
+            partial_func.__name__ = mcp_tool.name
+            
+            tool = MCPTool(
+                name=mcp_tool.name,
+                description=getattr(mcp_tool, 'description', None) or "",
+                inputs=inputs,
+                required=required,
+                function=partial_func
+            )
+            all_tools.append(tool)
+        
+        tool_collection =Toolkit(name=next(iter(config.get("mcpServers").keys())), tools=all_tools)
+        return tool_collection
 
-        # Create a single MCPTool for all tools from this server
-        server_name = list(config["mcpServers"].keys())[0]
-        tool = MCPTool(
-            name=server_name,
-            descriptions=all_descriptions,
-            schemas=all_schemas,
-            tools=all_functions,
-        )
-        return tool
     
-    def get_tools(self) -> List[Tool]:
-        """Return a list of MCPTools, one per server."""
+    def get_toolkits(self) -> List[Toolkit]:
+        """Return a list ofToolkits, one per server."""
         if not self.sessions:
             raise RuntimeError("Session not initialized")
 
@@ -228,9 +280,18 @@ class MCPToolkit:
         if config:
             parameters += self._from_config(config)
         
-        self.servers = [MCPClient(parameters)]
+        # Initialize servers list
+        self.servers = []
+        
+        # Only create MCPClient if we have parameters
+        if parameters:
+            self.servers.append(MCPClient(parameters))
+        
+        # Add additional servers if provided
         if servers:
-            self.servers += servers
+            self.servers.extend(servers)
+        
+        # Connect to all servers
         for server in self.servers:
             try:
                 server._connect()
@@ -277,12 +338,16 @@ class MCPToolkit:
         for server in self.servers:
             server._disconnect()
         
-    def get_tools(self):
+    def get_toolkits(self) -> List[Toolkit]:
         """Return a flattened list of all tools across all servers"""
         all_tools = []
+        if not self.servers:
+            logger.info("No MCP servers configured, returning empty toolkit list")
+            return all_tools
+            
         for server in self.servers:
             try:
-                tools = server.get_tools()
+                tools = server.get_toolkits()
                 all_tools.extend(tools)
                 logger.info(f"Added {len(tools)} tools from MCP server")
             except Exception as e:

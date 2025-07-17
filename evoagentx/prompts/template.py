@@ -7,7 +7,7 @@ from typing import Union, Optional, List, Any, Type
 from ..core.logging import logger 
 from ..core.module import BaseModule 
 from ..models.base_model import LLMOutputParser, PARSER_VALID_MODE 
-from ..tools import Tool
+from ..tools import Toolkit
 from ..prompts.tool_calling import TOOL_CALLING_TEMPLATE
 
 class PromptTemplate(BaseModule):
@@ -15,7 +15,7 @@ class PromptTemplate(BaseModule):
     instruction: str = Field(description="The instruction that the LLM will follow.")
     context: Optional[str] = Field(default=None, description="Additional context that can help the LLM understand the instruction.")
     constraints: Optional[Union[List[str], str]] = Field(default=None, description="Constraints that the LLM must follow.")
-    tools: Optional[List[Tool]] = Field(default=None, description="Tools that the LLM can use.")
+    tools: Optional[List[Toolkit]] = Field(default=None, description="Tools that the LLM can use.")
     demonstrations: Optional[List[dict]] = Field(default=None, description="Examples of how to use the instruction.")
     history: Optional[List[Any]] = Field(default=None, description="History of the conversation between the user and the LLM.")
 
@@ -67,7 +67,7 @@ class PromptTemplate(BaseModule):
     def set_constraints(self, constraints: Union[List[str], str]):
         self.set("constraints", constraints)
 
-    def set_tools(self, tools: List[str]):
+    def set_tools(self, tools: List[Toolkit]):
         self.set("tools", tools)
 
     def get_required_inputs_or_outputs(self, format: Type[LLMOutputParser]) -> List[str]:
@@ -183,8 +183,7 @@ class PromptTemplate(BaseModule):
             return ""
         tools_schemas = [tool.get_tool_schemas() for tool in self.tools]
         tools_schemas = [j for i in tools_schemas for j in i]
-        tool_calling_instructions = [tool.get_tool_prompt() for tool in self.tools]
-        return TOOL_CALLING_TEMPLATE.format(tools_description=tools_schemas, additional_context=tool_calling_instructions)
+        return TOOL_CALLING_TEMPLATE.format(tools_description=tools_schemas)
     
     def render_constraints(self) -> str:
         if not self.constraints:
@@ -554,3 +553,14 @@ class ChatTemplate(StringTemplate):
         
         return messages
         
+
+class MiproPromptTemplate(ChatTemplate):
+
+    def render_demonstrations(self, inputs_format: LLMOutputParser, outputs_format: LLMOutputParser, parse_mode: str, title_format: str = None, custom_output_format: str = None) -> List[dict]:
+        
+        import dspy
+        if self.demonstrations:
+            demo = self.demonstrations[0]
+            if isinstance(demo, dspy.Example):
+                self.demonstrations = [demo.toDict() for demo in self.demonstrations]
+        return super().render_demonstrations(inputs_format, outputs_format, parse_mode, title_format, custom_output_format)

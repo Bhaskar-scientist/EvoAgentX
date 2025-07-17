@@ -11,7 +11,7 @@ from ..core.module import BaseModule
 from ..core.decorators import atomic_method
 from ..storages.base import StorageHandler
 from ..models.model_configs import LLMConfig
-from ..tools.tool import Tool
+from ..tools.tool import Toolkit, Tool
 class AgentState(str, Enum):
     AVAILABLE = "available"
     RUNNING = "running"
@@ -30,23 +30,17 @@ class AgentManager(BaseModule):
     agent_states: Dict[str, AgentState] = Field(default_factory=dict) # agent_name to AgentState mapping
     storage_handler: Optional[StorageHandler] = None # used to load and save agent from storage.
     # agent_generator: Optional[AgentGenerator] = None # used to generate agents for a specific subtask
-    tools: Optional[List[Tool]] = None
-    tools_mapping: Optional[Dict[str, Tool]] = None
+    tools: Optional[List[Union[Toolkit, Tool]]] = None
 
     def init_module(self):
         self._lock = threading.Lock()
         self._state_conditions = {}
-        self.init_tools()
         if self.agents:
             for agent in self.agents:
                 self.agent_states[agent.name] = self.agent_states.get(agent.name, AgentState.AVAILABLE)
                 if agent.name not in self._state_conditions:
                     self._state_conditions[agent.name] = threading.Condition()
             self.check_agents()
-    
-    def init_tools(self):
-        if self.tools:
-            self.tools_mapping = {tool.name: tool for tool in self.tools}
     
     def check_agents(self):
         """Validate agent list integrity and state consistency.
@@ -133,6 +127,79 @@ class AgentManager(BaseModule):
         """
         pass 
     
+    def update_tools(self, agent_data: dict) -> None:
+        """
+        Update agent_data with tools based on tool_names.
+        
+        Handles four scenarios:
+        1. Neither tool_names nor tools exist: return directly
+        2. Only tool_names exists: resolve tool_names to tools and set tools field
+        3. Only tools exists: return directly (no action needed)
+        4. Both exist: merge tool_names into existing tools (skip duplicates)
+        
+        Args:
+            agent_data (dict): Agent configuration dictionary that may contain 'tool_names' and/or 'tools'
+            
+        Raises:
+            ValueError: If tool_names exist but self.tools is None, or if requested tools are not found
+        """
+        tool_names = agent_data.get("tool_names", None)
+        existing_tools = agent_data.get("tools", None)
+        
+        # Case 1: Neither tool_names nor tools exist
+        if not tool_names and not existing_tools:
+            return
+        
+        # Case 3: Only tools exist (no tool_names)
+        if not tool_names and existing_tools:
+            return
+        
+        # For cases 2 and 4: tool_names exists, need to resolve
+        if self.tools is None:
+            raise ValueError(
+                f"Agent requires tools {tool_names}, but no tools are available in AgentManager. "
+                f"Please set self.tools before creating agents with tool_names."
+            )
+        
+        # Create tool mapping from available tools
+        tool_mapping = {}
+        for tool in self.tools:
+            tool_mapping[tool.name] = tool
+        
+        # Case 2: Only tool_names exists - initialize empty tools list
+        if tool_names and not existing_tools:
+            existing_tools = []
+        
+        # Case 2 & 4: Process tool_names (either with empty or existing tools list)
+        if tool_names:
+            # Create a set of existing tool names for quick lookup
+            existing_tool_names = {tool.name for tool in existing_tools}
+            
+            tools_to_add = []
+            missing_tools = []
+            
+            for tool_name in tool_names:
+                # Skip if tool already exists in tools
+                if tool_name in existing_tool_names:
+                    continue
+                    
+                # Try to resolve new tool
+                if tool_name in tool_mapping:
+                    tools_to_add.append(tool_mapping[tool_name])
+                else:
+                    missing_tools.append(tool_name)
+            
+            if missing_tools:
+                available_tools = list(tool_mapping.keys())
+                raise ValueError(
+                    f"The following tools are not available: {missing_tools}. "
+                    f"Available tools: {available_tools}"
+                )
+            
+            # Merge new tools with existing ones
+            if tools_to_add:
+                agent_data["tools"] = list(existing_tools) + tools_to_add
+
     def create_customize_agent(self, agent_data: dict, llm_config: Optional[Union[LLMConfig, dict]]=None, **kwargs) -> CustomizeAgent:
         """
         create a customized agent from the provided `agent_data`. 
@@ -160,8 +227,13 @@ class AgentManager(BaseModule):
             elif isinstance(agent_llm_config, LLMConfig):
                 agent_data["llm_config"] = agent_llm_config.to_dict()
         
-        if agent_data.get("tool_names", None):
-            agent_data["tools"] = [self.tools_mapping[tool_name] for tool_name in agent_data["tool_names"]]
+        # tool_mapping = {}
+        # if self.tools is not None:
+        #     for tool in self.tools:
+        #         tool_mapping[tool.name] = tool
+        # if agent_data.get("tool_names", None):
+        #     agent_data["tools"] = [tool_mapping[tool_name] for tool_name in agent_data["tool_names"]]
+        self.update_tools(agent_data=agent_data) # add `tools` field if needed 
         return CustomizeAgent.from_dict(data=agent_data)
     
     def get_agent_name(self, agent: Union[str, dict, Agent]) -> str:
@@ -222,8 +294,13 @@ class AgentManager(BaseModule):
             **kwargs (Any): Additional parameters for agent creation
         """
         # Check for 'tool' key and convert it to 'tools' if needed
-        if isinstance(agent, dict) and "tool_names" in agent:
-            agent["tools"] = [self.tools_mapping[tool_name] for tool_name in agent["tool_names"]]
+        # if isinstance(agent, dict) and "tool_names" in agent:
+        #     tools_mapping = {}
+        #     if self.tools is not None:
+        #         for tool in self.tools:
+        #             tools_mapping[tool.name] = tool
+        #     agent["tools"] = [tools_mapping[tool_name] for tool_name in agent["tool_names"]]
+        #     agent["tools"] = [tool if isinstance(tool, Toolkit) else Toolkit(name=tool.name, tools=[tool]) for tool in agent["tools"]]
         
         agent_name = self.get_agent_name(agent=agent)
         if self.has_agent(agent_name=agent_name):
@@ -421,3 +498,8 @@ class AgentManager(BaseModule):
                 timeout=timeout
             )
 
+    def copy(self) -> "AgentManager":
+        """
+        Create a shallow copy of the AgentManager.
+        """
+        return AgentManager(agents=self.agents, storage_handler=self.storage_handler)

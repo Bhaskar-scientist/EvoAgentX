@@ -1,12 +1,12 @@
 import os 
 from dotenv import load_dotenv
 from evoagentx.core import Message 
-from evoagentx.models import OpenAILLMConfig, LiteLLMConfig
+from evoagentx.models import OpenAILLMConfig
 from evoagentx.agents import CustomizeAgent
-from evoagentx.prompts import StringTemplate 
+from evoagentx.prompts import StringTemplate, ChatTemplate
 from evoagentx.core.module_utils import extract_code_blocks as util_extract_code_blocks
 from evoagentx.core.registry import register_parse_function
-from evoagentx.tools import FileTool 
+from evoagentx.tools.file_tool import FileToolkit 
 from evoagentx.tools.mcp import MCPToolkit
 
 load_dotenv()
@@ -117,6 +117,20 @@ def build_customize_agent_with_prompt_template():
     print(f"Response from {agent.name}:")
     print(message.content.content)
 
+def build_customize_agent_with_chat_prompt_template():
+
+    agent = CustomizeAgent(
+        name="FirstAgent",
+        description="A simple agent that prints hello world",
+        prompt_template=ChatTemplate(
+            instruction="Print 'hello world'",
+        ),
+        llm_config=model_config
+    )
+
+    message = agent()
+    print(f"Response from {agent.name}:")
+    print(message.content.content)
 
 def build_customize_agent_with_inputs_and_outputs_and_prompt_template(): 
 
@@ -170,18 +184,18 @@ def build_customize_agent_with_tools():
         # outputs=[
         #     {"name": "code", "type": "string", "description": "The generated Python code"}
         # ],
-        tools=[FileTool()]
+        tools=[FileToolkit()]
     )
 
     message = code_writer(
-        inputs={"requirement": "Write a function that returns the sum of two numbers", "file_path": "output/test_code.py"}
+        inputs={"requirement": "Write a function that returns the sum of two numbers", "file_path": "examples/output/test_code.py"}
     )
     print(f"Response from {code_writer.name}:")
-    print(message.content)
+    print(message.content.content)
 
 def build_customize_agent_with_MCP(config_path):
-    mcp_toolkit = MCPToolkit(config_path=config_path)
-    tools = mcp_toolkit.get_tools()
+    mcp_Toolkit = MCPToolkit(config_path=config_path)
+    tools = mcp_Toolkit.get_toolkits()
     
     customize_agent = CustomizeAgent(
         name="MCPToolUser",
@@ -227,7 +241,9 @@ def build_customize_agent_with_custom_parse_and_format():
     person_info_agent = CustomizeAgent(
         name="PersonInfoExtractor",
         description="Extracts structured person information in XML format",
-        prompt="Extract information about the following person: {person_description}",
+        prompt_template=StringTemplate(
+            instruction="Extract information about the following person: `person_description`"
+        ),
         llm_config=model_config,
         inputs=[
             {"name": "person_description", "type": "string", "description": "Description of the person"}
@@ -475,30 +491,33 @@ def test_xml_parse_mode_with_template():
     print("Places:", message.content.places)
 
 if __name__ == "__main__":
+
+    # build customized agents without tools 
     build_customize_agent()
     build_customize_agent_with_inputs()
     build_customize_agent_with_inputs_and_outputs()
-    build_customize_agent_with_custom_parse_func()
-    build_customize_agent_with_prompt_template()
-    build_customize_agent_with_inputs_and_outputs_and_prompt_template()
-    build_customize_agent_with_tools()
-    build_customize_agent_with_custom_parse_and_format()
-    
+
     # Test different parse modes
-    ## Should the outputs support other types like int, float etc.?
+    build_customize_agent_with_custom_parse_func()
     build_customize_agent_with_json_parse()
     test_str_parse_mode()
-    ## Integrating title format?
     test_title_parse_mode()
     test_xml_parse_mode()
-    
+
     # Test parse modes with PromptTemplate
+    build_customize_agent_with_prompt_template()
+    build_customize_agent_with_chat_prompt_template()
+    build_customize_agent_with_custom_parse_and_format()
+    build_customize_agent_with_inputs_and_outputs_and_prompt_template()
     test_str_parse_mode_with_template()
     test_title_parse_mode_with_template()
     test_xml_parse_mode_with_template()
+
+    # build customized agents wtih tools 
+    build_customize_agent_with_tools()
     
     # Test MCP prompt
-    config_path = "examples/output/tests/shares_mcp.config"
+    config_path = "examples/tools/sample_mcp.config"
     if os.path.exists(config_path):
         build_customize_agent_with_MCP(config_path=config_path)
     else:

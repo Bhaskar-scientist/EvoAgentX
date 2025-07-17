@@ -38,7 +38,7 @@ Results:
 AGENT_GENERATION_TOOLS_PROMPT = """
 In the following Tools Description section, you are offered with the following tools. A short description of each functionality is also provided for each tool.
 You should assign tools to agent if you think it would be helpful for the agent to use the tool.
-A sample output for tool argument looks like this following line: 
+A sample output for tool argument looks like this following line (The example tools are not real tools): 
 tools: ["File Tool", "Browser Tool"]
 
 **Tools Description**
@@ -58,6 +58,8 @@ You should STOP GENERATING responds RIGHT AFTER you give the tool calling instru
 By checking the history, IF you get the information, you should **NOT** call any tool.
 Do not generate any tool calling instructions if you have the information. 
 Distinguish tool calls and tool calling arguments, only include "```ToolCalling" when you are calling the tool, otherwise you should pass arguments with out this catch phrase.
+The tools in the Example Output does not really exist, you should use the tools in the Available Tools section.
+Every tool call should contain the function name and function arguments. The function name should be the name of the tool you are calling. The function arguments in the next example are fake arguments, you should use the real arguments for the tool you are calling.
 
 ** Example Output **
 Base on the goal, I found out that I need to use the following tools:
@@ -91,17 +93,14 @@ After using a tool, analyze its output and determine next steps.
 **Available Tools**
 {tools_description}
 
-**Additional Tool Calling Instructions**
-{additional_context}
-
 ** Tool Calling Key Points **
-- You do not have to use the tool.
-- Tools might not be useful for the task, if you find out so, you should not call the tool.
-- You should always check the history to determine if you have the information or the tool is not useful, if you have the information, you should not use the tool.
-- You should try to use tools to get the information you need
-- You should not call any tool if you completed the goal
-- The tool you called must exist in the available tools
-- You should never write comments in the call_tool function
-- If your next move cannot be completed by the tool, you should not call the tool
+You do not have to use the tool.
+Tools might not be useful for the task, if you find out so, you should not call the tool.
+You should always check the history to determine if you have the information or the tool is not useful, if you have the information, you should not use the tool.
+You should try to use tools to get the information you need
+You should not call any tool if you completed the goal
+The tool you called must exist in the available tools
+You should never write comments in the call_tool function
+If your next move cannot be completed by the tool, you should not call the tool
 """
 

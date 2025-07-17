@@ -116,7 +116,9 @@ outputs/
 examples/output/**
 !examples/output/tetris_game/
 !examples/output/tetris_game/workflow_demo_4o_mini.json
-debug/
+!examples/output/tools/
+!examples/output/tools/*
+debug*/
 debug*.py
 logs/
 evoagentx/app/app.env

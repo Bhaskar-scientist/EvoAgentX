@@ -13,30 +13,32 @@ openai_config = OpenAILLMConfig(model="gpt-4o-mini", openai_key=OPENAI_API_KEY, 
 
 def test_MCP_server():
     
-    mcp_toolkit = MCPToolkit(config_path="examples/output/tests/shares_mcp.config")
-    tools = mcp_toolkit.get_tools()
+    mcp_Toolkit = MCPToolkit(config_path="examples/output/mcp_agent/mcp.config")
+    tools = mcp_Toolkit.get_toolkits()
     
-    code_writer = CustomizeAgent(
-        name="CodeWriter",
-        description="Writes Python code based on requirements",
+    mcp_agent = CustomizeAgent(
+        name="MCPAgent",
+        description="A MCP agent that can use the tools provided by the MCP server",
         prompt_template= StringTemplate(
-            instruction="Summarize all your tools."
+            instruction="Do some operations based on the user's instruction."
         ), 
         llm_config=openai_config,
         inputs=[
             {"name": "instruction", "type": "string", "description": "The goal you need to achieve"}
         ],
         outputs=[
-            {"name": "result", "type": "string", "description": "The tools you have"}
+            {"name": "result", "type": "string", "description": "The result of the operation"}
         ],
-        tool_names=[tool.name for tool in tools],
-        tool_dict={tool.name: tool for tool in tools}
+        tools=tools
     )
+    mcp_agent.save_module("examples/output/mcp_agent/mcp_agent.json")
+    mcp_agent.load_module("examples/output/mcp_agent/mcp_agent.json", llm_config=openai_config, tools=tools)
 
-    message = code_writer(
-        inputs={"instruction": "Summarize all your tools."}
+    message = mcp_agent(
+        inputs={"instruction": "Summarize all the tools."}
     )
-    print(f"Response from {code_writer.name}:")
+    
+    print(f"Response from {mcp_agent.name}:")
     print(message.content.result)
 
 if __name__ == "__main__":
